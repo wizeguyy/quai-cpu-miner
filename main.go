@@ -2,13 +2,10 @@ package main
 
 import (
 	"context"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"log"
-	"math"
 	"math/big"
-	"math/rand"
 	"os"
 	"strconv"
 	"sync"
@@ -25,6 +22,7 @@ import (
 const (
 	// resultQueueSize is the size of channel listening to sealing result.
 	resultQueueSize = 10
+	maxRetryDelay   = 60 * 60 * 4 // 4 hours
 )
 
 var (
@@ -44,25 +42,57 @@ type Miner struct {
 	// RPC client connections to the Quai nodes
 	sliceClients SliceClients
 
-	// Channel to update miners with new work
-	updatedCh chan *types.Header
+	// Channel to receive header updates
+	updateCh chan *types.Header
 
 	// Channel to submit completed work
 	resultCh  chan *types.Header
 
 	// Track previous block number for pretty printing
-	previousNumber []*big.Int
+	previousNumber [common.HierarchyDepth]uint64
 }
 
 // Clients for RPC connection to the Prime, region, & zone node belonging to the
 // slice we are actively mining
-type SliceClients struct {
-	prime  *ethclient.Client
-	region *ethclient.Client
-	zone   *ethclient.Client
-}
+type SliceClients [common.HierarchyDepth]*ethclient.Client
 
-var exponentialBackoffCeilingSecs int64 = 14400 // 4 hours
+// getNodeClients takes in a config and retrieves the Prime, Region, and Zone client
+// that is used for mining in a slice.
+func connectToSlice(config util.Config) SliceClients {
+	var err error
+	loc := config.Location
+	clients := SliceClients{}
+	primeConnected := false
+	regionConnected := false
+	zoneConnected := false
+	for !primeConnected || !regionConnected || !zoneConnected {
+		if config.PrimeURL != "" && !primeConnected {
+			clients[common.PRIME_CTX], err = ethclient.Dial(config.PrimeURL)
+			if err != nil {
+				log.Println("Unable to connect to node:", "Prime", config.PrimeURL)
+			} else {
+				primeConnected = true
+			}
+		}
+		if config.RegionURLs[loc.Region()] != "" && !regionConnected {
+			clients[common.REGION_CTX], err = ethclient.Dial(config.RegionURLs[loc.Region()])
+			if err != nil {
+				log.Println("Unable to connect to node:", "Region", config.RegionURLs[loc.Region()])
+			} else {
+				regionConnected = true
+			}
+		}
+		if config.ZoneURLs[loc.Region()][loc.Zone()] != "" && !zoneConnected {
+			clients[common.ZONE_CTX], err = ethclient.Dial(config.ZoneURLs[loc.Region()][loc.Zone()])
+			if err != nil {
+				log.Println("Unable to connect to node:", "Zone", config.ZoneURLs[loc.Region()][loc.Zone()])
+			} else {
+				zoneConnected = true
+			}
+		}
+	}
+	return clients
+}
 
 func main() {
 	// Load config
@@ -89,117 +119,47 @@ func main() {
 		engine:         blake3Engine,
 		sliceClients:   connectToSlice(config),
 		header:         types.EmptyHeader(),
+		updateCh:      make(chan *types.Header, resultQueueSize),
 		resultCh:       make(chan *types.Header, resultQueueSize),
-		updatedCh:      make(chan *types.Header, resultQueueSize),
-		previousNumber: make([]*big.Int, 3),
+		previousNumber: [common.HierarchyDepth]uint64{0,0,0},
 	}
-	m.previousNumber = []*big.Int{big.NewInt(0), big.NewInt(0), big.NewInt(0)}
 	log.Println("Starting Quai cpu miner in location ", config.Location)
 	m.fetchPendingHeader()
 	go m.subscribePendingHeader()
 	go m.resultLoop()
 	go m.miningLoop()
-	go m.SubmitHashRate()
+	go m.hashratePrinter()
 	<-exit
 }
 
-// getNodeClients takes in a config and retrieves the Prime, Region, and Zone client
-// that is used for mining in a slice.
-func connectToSlice(config util.Config) SliceClients {
-	var err error
-	loc := config.Location
-	clients := SliceClients{}
-	primeConnected := false
-	regionConnected := false
-	zoneConnected := false
-	for !primeConnected || !regionConnected || !zoneConnected {
-		if config.PrimeURL != "" && !primeConnected {
-			clients.prime, err = ethclient.Dial(config.PrimeURL)
-			if err != nil {
-				log.Println("Unable to connect to node:", "Prime", config.PrimeURL)
-			} else {
-				primeConnected = true
-			}
-		}
-		if config.RegionURLs[loc.Region()] != "" && !regionConnected {
-			clients.region, err = ethclient.Dial(config.RegionURLs[loc.Region()])
-			if err != nil {
-				log.Println("Unable to connect to node:", "Region", config.RegionURLs[loc.Region()])
-			} else {
-				regionConnected = true
-			}
-		}
-		if config.ZoneURLs[loc.Region()][loc.Zone()] != "" && !zoneConnected {
-			clients.zone, err = ethclient.Dial(config.ZoneURLs[loc.Region()][loc.Zone()])
-			if err != nil {
-				log.Println("Unable to connect to node:", "Zone", config.ZoneURLs[loc.Region()][loc.Zone()])
-			} else {
-				zoneConnected = true
-			}
-		}
-	}
-	return clients
-}
+func (m *Miner) client(ctx int) *ethclient.Client {return m.sliceClients[ctx]}
 
 // subscribePendingHeader subscribes to the head of the mining nodes in order to pass
 // the most up to date block to the miner within the manager.
 func (m *Miner) subscribePendingHeader() {
-	// done channel in case best Location updates
-	// subscribe to the pending block only if not synching
-	// if checkSync == nil && err == nil {
-	// Wait for chain events and push them to clients
-	header := make(chan *types.Header)
-	sub, err := m.sliceClients.zone.SubscribePendingHeader(context.Background(), header)
-	if err != nil {
-		log.Fatal("Failed to subscribe to pending block events", err)
+	if _, err := m.client(common.ZONE_CTX).SubscribePendingHeader(context.Background(), m.updateCh); err != nil {
+		log.Fatal("Failed to subscribe to pending header events", err)
 	}
-	defer sub.Unsubscribe()
-	// Wait for various events and passing to the appropriate background threads
-	for {
-		select {
-		case m.header = <-header:
-			// New head arrived, send if for state update if there's none running
-			m.updatedCh <- m.header
-		}
-	}
-	// }
 }
 
 // PendingBlocks gets the latest block when we have received a new pending header. This will get the receipts,
 // transactions, and uncles to be stored during mining.
 func (m *Miner) fetchPendingHeader() {
-	var header *types.Header
-	var err error
-	// Get new header from the node
-	header, err = m.sliceClients.zone.GetPendingHeader(context.Background())
-	// retrying for 5 times if pending block not found
-	if err != nil || header == nil {
-		log.Println("Pending block not found error:", err)
-		found := false
-		attempts := 0
-		lastUpdatedAt := time.Now()
-		for !found {
-			if time.Now().Sub(lastUpdatedAt).Hours() >= 12 {
-				attempts = 0
+	retryDelay := 1 // Start retry at 1 second
+	for {
+		header, err := m.client(common.ZONE_CTX).GetPendingHeader(context.Background())
+		if err != nil {
+			log.Println("Pending block not found error: ", err)
+			time.Sleep(time.Duration(retryDelay) * time.Second)
+			retryDelay *= 2
+			if retryDelay > maxRetryDelay {
+				retryDelay = maxRetryDelay
 			}
-			header, err = m.sliceClients.zone.GetPendingHeader(context.Background())
-			if err == nil && header != nil {
-				break
-			}
-			lastUpdatedAt = time.Now()
-			attempts += 1
-			// exponential back-off implemented
-			delaySecs := int64(math.Floor((math.Pow(2, float64(attempts)) - 1) * 0.5))
-			if delaySecs > exponentialBackoffCeilingSecs {
-				delaySecs = exponentialBackoffCeilingSecs
-			}
-			// should only get here if the ffmpeg record stream process dies
-			fmt.Printf("This is attempt %d to fetch pending block. Waiting %d seconds and then retrying...\n", attempts, delaySecs)
-			// Sleep before retrying
-			time.Sleep(time.Duration(delaySecs) * time.Second)
+		} else {
+			m.updateCh <- header
+			break
 		}
 	}
-	m.updatedCh <- header
 }
 
 // miningLoop iterates on a new header and passes the result to m.resultCh. The result is called within the method.
@@ -216,26 +176,30 @@ func (m *Miner) miningLoop() error {
 	}
 	for {
 		select {
-		case header := <-m.updatedCh:
-			// If the header has zero numbers
-			if header.Number(0).Cmp(common.Big0) == 0 || header.Number(1).Cmp(common.Big0) == 0 || header.Number(2).Cmp(common.Big0) == 0 {
-				continue
-			}
+		case header := <-m.updateCh:
 			// Mine the header here
 			// Return the valid header with proper nonce and mix digest
 			// Interrupt previous sealing operation
 			interrupt()
 			stopCh = make(chan struct{})
-			if header.Number(0).Cmp(m.previousNumber[0]) != 0 || header.Number(1).Cmp(m.previousNumber[1]) != 0 || header.Number(2).Cmp(m.previousNumber[2]) != 0 {
-				if header.Number(0).Cmp(m.previousNumber[0]) != 0 {
-					log.Println("Mining Block:  ", fmt.Sprintf("[%s %s %s]", color.Ize(color.Red, fmt.Sprint(header.Number(0))), header.Number(1).String(), header.Number(2).String()), "location", header.Location(), "difficulty", header.DifficultyArray())
-				} else if header.Number(1).Cmp(m.previousNumber[1]) != 0 {
-					log.Println("Mining Block:  ", fmt.Sprintf("[%s %s %s]", header.Number(0).String(), color.Ize(color.Yellow, fmt.Sprint(header.Number(1))), header.Number(2).String()), "location", header.Location(), "difficulty", header.DifficultyArray())
-				} else {
-					log.Println("Mining Block:  ", header.NumberArray(), "location", header.Location(), "difficulty", header.DifficultyArray())
+			number := [common.HierarchyDepth]uint64{header.NumberU64(common.PRIME_CTX),header.NumberU64(common.REGION_CTX),header.NumberU64(common.ZONE_CTX)}
+			primeStr := fmt.Sprint(number[common.PRIME_CTX])
+			regionStr := fmt.Sprint(number[common.REGION_CTX])
+			zoneStr := fmt.Sprint(number[common.ZONE_CTX])
+			if number != m.previousNumber {
+				if number[common.PRIME_CTX] != m.previousNumber[common.PRIME_CTX] {
+					primeStr = color.Ize(color.Red, primeStr)
+					regionStr = color.Ize(color.Red, regionStr)
+					zoneStr = color.Ize(color.Red, zoneStr)
+				} else if number[common.REGION_CTX] != m.previousNumber[common.REGION_CTX] {
+					regionStr = color.Ize(color.Yellow, regionStr)
+					zoneStr = color.Ize(color.Yellow, zoneStr)
+				} else if number[common.ZONE_CTX] != m.previousNumber[common.ZONE_CTX] {
+					zoneStr = color.Ize(color.Blue, zoneStr)
 				}
-				m.previousNumber = header.NumberArray()
+				log.Println("Mining Block: ", fmt.Sprintf("[%s %s %s]", primeStr, regionStr, zoneStr), "location", header.Location(), "difficulty", header.DifficultyArray())
 			}
+			m.previousNumber = [common.HierarchyDepth]uint64{header.NumberU64(common.PRIME_CTX),header.NumberU64(common.REGION_CTX),header.NumberU64(common.ZONE_CTX)}
 			header.SetTime(uint64(time.Now().Unix()))
 			if err := m.engine.Seal(header, m.resultCh, stopCh); err != nil {
 				log.Println("Block sealing failed", "err", err)
@@ -245,24 +209,41 @@ func (m *Miner) miningLoop() error {
 }
 
 // WatchHashRate is a simple method to watch the hashrate of our miner and log the output.
-func (m *Miner) SubmitHashRate() {
+func (m *Miner) hashratePrinter() {
 	ticker := time.NewTicker(60 * time.Second)
-	// generating random ID to submit in the SubmitHashRate method
-	randomId := rand.Int()
-	randomIdArray := make([]byte, 8)
-	binary.LittleEndian.PutUint64(randomIdArray, uint64(randomId))
-	var null float64 = 0
-	go func() {
+	toSiUnits := func (hr float64) (float64, string) {
+		reduced := hr
+		order := 0
 		for {
-			select {
-			case <-ticker.C:
-				hashRate := m.engine.Hashrate()
-				if hashRate != null {
-					log.Println("Quai Miner  :   Hashes per second: ", hashRate)
-				}
+			if reduced >= 1000 {
+				reduced /= 1000
+				order += 3
+			} else {
+				break;
 			}
 		}
-	}()
+		switch order {
+		case 3:
+			return reduced, "Kh/s"
+		case 6:
+			return reduced, "Mh/s"
+		case 9:
+			return reduced, "Gh/s"
+		case 12:
+			return reduced, "Th/s"
+		default:
+			// If reduction didn't work, just return the original
+			return hr, "h/s"
+		}
+	}
+	for {
+		select {
+		case <-ticker.C:
+			hashRate := m.engine.Hashrate()
+			hr, units := toSiUnits(hashRate)
+			log.Println("Current hashrate: ", hr, units)
+		}
+	}
 }
 
 // resultLoop takes in the result and passes to the proper channels for receiving.
@@ -274,100 +255,38 @@ func (m *Miner) resultLoop() error {
 			if err != nil {
 				log.Println("Block mined has an invalid order")
 			}
-			if context == 0 {
-				log.Println(color.Ize(color.Red, "PRIME block :  "), header.NumberArray(), header.Hash())
+			switch context {
+			case common.PRIME_CTX:
+				log.Println(color.Ize(color.Red, "PRIME block : "), header.NumberArray(), header.Hash())
+			case common.REGION_CTX:
+				log.Println(color.Ize(color.Yellow, "REGION block: "), header.NumberArray(), header.Hash())
+			case common.ZONE_CTX:
+				log.Println(color.Ize(color.Blue, "ZONE block  : "), header.NumberArray(), header.Hash())
 			}
-			if context == 1 {
-				log.Println(color.Ize(color.Yellow, "REGION block:  "), header.NumberArray(), header.Hash())
+			// Send to whichever nodes should be aware of this block
+			var wg sync.WaitGroup
+			if context <= common.PRIME_CTX {
+				go m.sendMinedHeader(common.PRIME_CTX, header, &wg)
 			}
-			if context == 2 {
-				log.Println(color.Ize(color.Blue, "Zone block  :  "), header.NumberArray(), header.Hash())
+			if context <= common.REGION_CTX {
+				go m.sendMinedHeader(common.REGION_CTX, header, &wg)
 			}
-			// Check to see that all nodes are running before sending blocks to them.
-			if !m.allChainsOnline() {
-				log.Println("At least one of the chains is not online at the moment")
-				continue
+			if context <= common.ZONE_CTX {
+				go m.sendMinedHeader(common.ZONE_CTX, header, &wg)
 			}
-			// Check proper difficulty for which nodes to send block to
-			// Notify blocks to put in cache before assembling new block on node
-			if context == 0 && header.Number(0) != nil {
-				var wg sync.WaitGroup
-				wg.Add(1)
-				go m.SendMinedHeader(2, header, &wg)
-				wg.Add(1)
-				go m.SendMinedHeader(1, header, &wg)
-				wg.Add(1)
-				go m.SendMinedHeader(0, header, &wg)
-				wg.Wait()
-			}
-			// If Region difficulty send to Region
-			if context == 1 && header.Number(1) != nil {
-				var wg sync.WaitGroup
-				wg.Add(1)
-				go m.SendMinedHeader(2, header, &wg)
-				wg.Add(1)
-				go m.SendMinedHeader(1, header, &wg)
-				wg.Wait()
-			}
-			// If Zone difficulty send to Zone
-			if context == 2 && header.Number(2) != nil {
-				var wg sync.WaitGroup
-				wg.Add(1)
-				go m.SendMinedHeader(2, header, &wg)
-				wg.Wait()
-			}
+			wg.Wait()
 		}
 	}
-}
-
-// allChainsOnline checks if every single chain is online before sending the mined block to make sure that we don't have
-// external blocks not found error
-func (m *Miner) allChainsOnline() bool {
-	if !checkConnection(m.sliceClients.prime) {
-		return false
-	}
-	if !checkConnection(m.sliceClients.region) {
-		return false
-	}
-	if !checkConnection(m.sliceClients.zone) {
-		return false
-	}
-	return true
 }
 
 // SendMinedHeader sends the mined block to its mining client with the transactions, uncles, and receipts.
-func (m *Miner) SendMinedHeader(mined int, header *types.Header, wg *sync.WaitGroup) {
-	if mined == 0 {
-		err := m.sliceClients.prime.ReceiveMinedHeader(context.Background(), header)
-		if err != nil {
-			fmt.Println("error submitting block: ", err)
-		}
-	}
-	if mined == 1 {
-		err := m.sliceClients.region.ReceiveMinedHeader(context.Background(), header)
-		if err != nil {
-			fmt.Println("error submitting block: ", err)
-		}
-	}
-	if mined == 2 {
-		err := m.sliceClients.zone.ReceiveMinedHeader(context.Background(), header)
-		if err != nil {
-			fmt.Println("error submitting block: ", err)
-		}
+func (m *Miner) sendMinedHeader(ctx int, header *types.Header, wg *sync.WaitGroup) {
+	wg.Add(1)
+	err := m.client(ctx).ReceiveMinedHeader(context.Background(), header)
+	if err != nil {
+		fmt.Println("error submitting block: ", err)
 	}
 	defer wg.Done()
-}
-
-// Checks if a connection is still there on orderedBlockClient.chainAvailable
-func checkConnection(client *ethclient.Client) bool {
-	_, err := client.HeaderByNumber(context.Background(), nil)
-	if err != nil {
-		log.Println("Error: connection lost")
-		log.Println(err)
-		return false
-	} else {
-		return true
-	}
 }
 
 var (
