@@ -4,8 +4,10 @@ import (
 	"context"
 	"fmt"
 	"log"
-
+	"net/http"
+	_ "net/http/pprof"
 	"os"
+	"runtime"
 	"strconv"
 	"time"
 
@@ -16,7 +18,6 @@ import (
 	"github.com/dominant-strategies/go-quai/consensus/blake3pow"
 	"github.com/dominant-strategies/go-quai/core/types"
 	"github.com/dominant-strategies/go-quai/quaiclient/ethclient"
-
 	"github.com/dominant-strategies/quai-cpu-miner/util"
 )
 
@@ -151,6 +152,8 @@ func main() {
 		resultCh:       make(chan *types.Header, resultQueueSize),
 		previousNumber: [common.HierarchyDepth]uint64{0, 0, 0},
 	}
+	log.Println("Starting pprof server")
+	EnablePprof(config.Location)
 	log.Println("Starting Quai cpu miner in location ", config.Location)
 	if config.Proxy {
 		m.proxyClient = connectToProxy(config)
@@ -394,4 +397,44 @@ func (m *Miner) incrementLatestID() uint64 {
 	cur := m.latestId
 	m.latestId += 1
 	return cur
+}
+
+func EnablePprof(location common.Location) {
+	runtime.SetBlockProfileRate(1)
+	runtime.SetMutexProfileFraction(1)
+	var port string
+	switch {
+	// Prime
+	case location.Context() == common.PRIME_CTX:
+		port = "21000"
+		// Regions
+	case location.Context() == common.REGION_CTX && location.Region() == 0:
+		port = "22000"
+	case location.Context() == common.REGION_CTX && location.Region() == 1:
+		port = "22001"
+	case location.Context() == common.REGION_CTX && location.Region() == 2:
+		port = "22002"
+	// Zones
+	case location.Region() == 0 && location.Zone() == 0:
+		port = "23000"
+	case location.Region() == 0 && location.Zone() == 1:
+		port = "23001"
+	case location.Region() == 0 && location.Zone() == 2:
+		port = "23002"
+	case location.Region() == 1 && location.Zone() == 0:
+		port = "23100"
+	case location.Region() == 1 && location.Zone() == 1:
+		port = "23101"
+	case location.Region() == 1 && location.Zone() == 2:
+		port = "23102"
+	case location.Region() == 2 && location.Zone() == 0:
+		port = "23200"
+	case location.Region() == 2 && location.Zone() == 1:
+		port = "23201"
+	case location.Region() == 2 && location.Zone() == 2:
+		port = "23202"
+	}
+	go func() {
+		http.ListenAndServe("localhost:"+port, nil)
+	}()
 }
