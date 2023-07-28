@@ -1,7 +1,7 @@
 version: '3'
 services:
   quai-cpu-miner-0-0:
-    image: quainetwork/quai-cpu-miner:291dbef
+    build: .
     network_mode: host
     volumes:
       - ./config/config.yaml:/go/config/config.yaml
@@ -15,7 +15,7 @@ services:
           memory: 4G
 
   quai-cpu-miner-0-1:
-    image: quainetwork/quai-cpu-miner:291dbef
+    build: .
     network_mode: host
     volumes:
       - ./config/config.yaml:/go/config/config.yaml
@@ -29,7 +29,7 @@ services:
           memory: 4G
 
   quai-cpu-miner-0-2:
-    image: quainetwork/quai-cpu-miner:291dbef
+    build: .
     network_mode: host
     volumes:
       - ./config/config.yaml:/go/config/config.yaml
@@ -43,7 +43,7 @@ services:
           memory: 4G
 
   quai-cpu-miner-1-0:
-    image: quainetwork/quai-cpu-miner:291dbef
+    build: .
     network_mode: host
     volumes:
       - ./config/config.yaml:/go/config/config.yaml
@@ -57,7 +57,7 @@ services:
           memory: 4G
 
   quai-cpu-miner-1-1:
-    image: quainetwork/quai-cpu-miner:291dbef
+    build: .
     network_mode: host
     volumes:
       - ./config/config.yaml:/go/config/config.yaml
@@ -71,7 +71,7 @@ services:
           memory: 4G
 
   quai-cpu-miner-1-2:
-    image: quainetwork/quai-cpu-miner:291dbef
+    build: .
     network_mode: host
     volumes:
       - ./config/config.yaml:/go/config/config.yaml
@@ -84,7 +84,7 @@ services:
           cpus: '.4'
           memory: 4G
   quai-cpu-miner-2-0:
-    image: quainetwork/quai-cpu-miner:291dbef
+    build: .
     network_mode: host
     volumes:
       - ./config/config.yaml:/go/config/config.yaml
@@ -98,7 +98,7 @@ services:
           memory: 4G
 
   quai-cpu-miner-2-1:
-    image: quainetwork/quai-cpu-miner:291dbef
+    build: .
     network_mode: host
     volumes:
       - ./config/config.yaml:/go/config/config.yaml
@@ -112,7 +112,7 @@ services:
           memory: 4G
 
   quai-cpu-miner-2-2:
-    image: quainetwork/quai-cpu-miner:291dbef
+    build: .
     network_mode: host
     volumes:
       - ./config/config.yaml:/go/config/config.yaml
